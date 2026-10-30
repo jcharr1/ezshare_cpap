@@ -1,5 +1,7 @@
 #! /bin/bash
-# VERSION=30
+# VERSION=31
+# Pipefail enabled but errors handled manually to collect them
+set -o pipefail
 #
 # Change log:
 #
@@ -37,6 +39,14 @@ sleepHQAPIBaseURL="https://sleephq.com" # The base URL for the Sleep HQ API
 sleepDataSyncEnabled=true # Pulls data from SD Card and optionally pushes it to Sleep HQ
 o2RingSyncEnabled=true # Scans the ${sdCardDir} for O2 Ring CSV export files and uploads them to Sleep HQ
 o2RingDeviceID="69184" # The device ID for the O2 ring. This is hard coded on the server and shouldn't change.
+mailRecipient="" # Email address to receive summary notifications
+mailOnlyOnError=false # If true, send email only on failure
+exitOnNoChanges=false # If true, exit with code 2 when no files are downloaded
+errorOccurred=0 # Tracks if any error occurred during execution
+errorLog="" # Collects error messages during execution
+debugEnabled=false # When true, enables bash tracing for troubleshooting
+numWifiAdaptors=0
+ezShareConnected=0
 
 # Colors!
 red="\033[31m"
@@ -73,6 +83,7 @@ waitForConnectivity() {
   local target="${1}"
   local output
   local attempts="5"
+  local delay=2
 
   if [ "${numWifiAdaptors}" -gt 1 ]; then
     attempts="15" # Keep trying... more
@@ -82,14 +93,19 @@ waitForConnectivity() {
     if curl -ks --connect-timeout 5 --max-time 60 -I "${target}" | grep "^HTTP/" | awk '{print $2}' | egrep "200|302|301" >/dev/null; then
       return 0
     fi
-    sleep 1
+    # Longer delay on first attempts to allow network stack to settle
+    if [ $i -le 3 ]; then
+      sleep 3
+    else
+      sleep $delay
+    fi
   done
 
   echo -e "${red} FAILED!${reset}\n\nFailed connectivity check to ${target}."
   echo "Please check network connectivity."
-  echo
-  echo "Cannot continue... exiting..."
-  exit 1
+  errorOccurred=1
+  errorLog+="Failed connectivity check to ${target} after ${attempts} attempts.\n"
+  return 1
 }
 
 # Connects to a given wifi network
@@ -101,14 +117,19 @@ connectToWifiNetwork() {
   local waitTime=10
   local os="$(uname)"
   local connected
+  local output
 
   while (( attempt < 5 )); do
     echo -n "Connecting to Wi-Fi '${ssid}' on ${wifiAdaptor}... "
     connected=false
+    output=""
 
     case "${os}" in
       Darwin)
-        if networksetup -setairportnetwork "${wifiAdaptor}" "${ssid}" "${password}" &>/dev/null; then
+        # networksetup exits 0 even when it can't find or join the network
+        # (e.g. "Could not find network ez Share.") and is silent on success,
+        # so any output means the connection attempt failed.
+        if output="$(networksetup -setairportnetwork "${wifiAdaptor}" "${ssid}" "${password}" 2>&1)" && [ -z "${output}" ]; then
           connected=true
         fi
         ;;
@@ -130,6 +151,7 @@ connectToWifiNetwork() {
     fi
 
     echo -e "\n\n${red}Failed to connect to Wi-Fi '${ssid}'.${reset}\n"
+    test -n "${output}" && echo -e "${output}\n"
     echo -n "Retrying in ${waitTime}s (Ctrl+C to abort)"
     for (( i=0; i<${waitTime}; i++ )); do
       echo -n "."
@@ -140,6 +162,8 @@ connectToWifiNetwork() {
   done
 
   echo -e "\n\n${red}Unable to connect to Wi-Fi '${ssid}' after ${attempt} attempts.${reset}"
+  errorOccurred=1
+  errorLog+="Unable to connect to Wi-Fi '${ssid}' after ${attempt} attempts.\n"
   return 1
 }
 
@@ -148,6 +172,15 @@ connectToWifiNetwork() {
 # after ourselves and reconnect to the home WiFi
 # if we're not already connected to it.
 exitFunction() {
+  local exitCode=$?
+  # Mark errorOccurred if script is exiting with non-zero, except for the
+  # deliberate "no changes" sentinel (exit code 2, see --exit-on-no-changes)
+  # which callers use to skip a subsequent stage via && chaining and isn't
+  # itself a failure.
+  if [ ${exitCode} -ne 0 ] && [ ${exitCode} -ne 2 ]; then
+    errorOccurred=1
+    errorLog+="Script exited with error code ${exitCode}.\n"
+  fi
   if [ "${ezShareSyncInProgress}" -eq 1 ]; then
     echo -e "Something went wrong with the sync. Rolling back changes in the DATALOG directory...\n"
 
@@ -174,8 +207,8 @@ exitFunction() {
     echo -e "\nCleanup complete"
   fi
 
-  if [ "${numWifiAdaptors}" -eq 1 ]; then
-    if [[ "${ezShareConnected}" -eq 1 ]]; then
+  if [[ "${numWifiAdaptors}" =~ ^[0-9]+$ ]] && [ "${numWifiAdaptors}" -eq 1 ]; then
+    if [[ "${ezShareConnected}" =~ ^[0-9]+$ ]] && [ "${ezShareConnected}" -eq 1 ]; then
       connectToWifiNetwork "${wifiAdaptor}" "${homeWiFiSSID}" "${homeWiFiPassword}"
     fi
   fi
@@ -194,9 +227,130 @@ exitFunction() {
   fi
 
   trap - INT TERM EXIT
-  exit
+  
+  # Send email summary at the end based on mode and errors
+  if [ -n "${mailRecipient}" ]; then
+    # Send email if: 1) errors occurred, OR 2) success and not in error-only mode
+    if [ "${errorOccurred}" -eq 1 ] || [ "${mailOnlyOnError}" = false ]; then
+      sendEmailSummary
+    fi
+  fi
+
+  exit ${exitCode}
 }
 
+# Send email summary - called once at end of script
+sendEmailSummary() {
+  local subject_prefix
+  local subject
+  local tmpBody="/tmp/ezshare_sync_summary.$$.html"
+  local filesCount=""
+  local status_class
+  local status_msg
+  
+  if [ "${errorOccurred}" -eq 1 ]; then
+    subject_prefix="✗ Failed:"
+    status_class="error"
+    status_msg="Errors occurred during sync"
+  elif [ "${syncStatus}" = "No changes" ]; then
+    subject_prefix="⏭ No changes:"
+    status_class="info"
+    status_msg="No new files to sync"
+  else
+    subject_prefix="✓ Success:"
+    status_class="success"
+    status_msg="Sync completed successfully"
+  fi
+
+  subject="${subject_prefix} EzShare Sync - $(date '+%Y-%m-%d %H:%M')"
+
+  if [ -f "${transferListFile}" ]; then
+    filesCount="$(wc -l < "${transferListFile}" | awk '{print $1}')"
+  fi
+
+  # Build status summary
+  local summary_html=""
+  if [ "${errorOccurred}" -eq 1 ]; then
+    summary_html="<div class=\"status error\">❌ ${status_msg}</div>"
+  elif [ "${syncStatus}" = "No changes" ]; then
+    summary_html="<div class=\"status info\">ℹ️ ${status_msg}</div>"
+  else
+    summary_html="<div class=\"status success\">✅ ${status_msg}</div>"
+  fi
+
+  # Build details section
+  local details_html="<h2>📊 Sync Details</h2>
+<table>
+  <tr><th>SD Card Directory</th><td><code>${sdCardDir}</code></td></tr>
+  <tr><th>Overall Duration</th><td>${overallTimeTaken:-N/A} seconds</td></tr>
+  <tr><th>Last Successful Sync</th><td>${lastSync:-Unknown}</td></tr>
+  <tr><th>Sync Status</th><td>${syncStatus:-Unknown}</td></tr>
+  <tr><th>Files Synced</th><td class=\"metric\">${filesCount:-0}</td></tr>
+  <tr><th>SleepHQ Upload</th><td>${uploadStatus:-Not performed}</td></tr>
+  <tr><th>O2 Ring Upload</th><td>${o2Status:-Not performed}</td></tr>
+</table>"
+
+  # Build error details section if errors occurred
+  if [ "${errorOccurred}" -eq 1 ] && [ -n "${errorLog}" ]; then
+    details_html="${details_html}
+<h2>⚠️ Error Details</h2>
+<div class=\"status error\">
+<pre style='margin:0; font-size:12px; white-space:pre-wrap; font-family:monospace;'>$(echo -e "${errorLog}")</pre>
+</div>"
+  fi
+
+  cat >"${tmpBody}" <<EOF
+Content-Type: text/html; charset=UTF-8
+From: $(whoami)@$(hostname)
+To: ${mailRecipient}
+Subject: ${subject}
+
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; line-height: 1.6; color: #333; max-width: 800px; margin: 0 auto; padding: 20px; background-color: #f5f5f5; }
+    .container { background: white; border-radius: 8px; padding: 30px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    h1 { color: #1a73e8; margin-top: 0; border-bottom: 3px solid #1a73e8; padding-bottom: 10px; }
+    h2 { color: #444; margin-top: 25px; border-bottom: 1px solid #ddd; padding-bottom: 8px; }
+    .status { padding: 15px; border-radius: 5px; margin: 20px 0; font-weight: bold; }
+    .success { background-color: #d4edda; color: #155724; border-left: 4px solid #28a745; }
+    .error { background-color: #f8d7da; color: #721c24; border-left: 4px solid #dc3545; }
+    .info { background-color: #d1ecf1; color: #0c5460; border-left: 4px solid #17a2b8; }
+    table { width: 100%; border-collapse: collapse; margin: 15px 0; }
+    th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+    th { background-color: #f8f9fa; font-weight: 600; color: #495057; }
+    tr:hover { background-color: #f8f9fa; }
+    .metric { font-size: 24px; font-weight: bold; color: #1a73e8; }
+    .footer { margin-top: 30px; padding-top: 20px; border-top: 1px solid #ddd; color: #666; font-size: 12px; }
+    code { background-color: #f4f4f4; padding: 2px 6px; border-radius: 3px; font-family: 'Courier New', monospace; }
+</style>
+</head>
+<body>
+<div class="container">
+<h1>💾 EzShare Sync Report</h1>
+${summary_html}
+${details_html}
+<div class="footer">
+<p><strong>Machine:</strong> $(hostname) | <strong>User:</strong> $(whoami) | <strong>Time:</strong> $(date '+%Y-%m-%d %I:%M:%S %p %Z')</p>
+<p>Tip: Use <code>--mail-on-error</code> to only receive emails on failures.</p>
+</div>
+</div>
+</body>
+</html>
+EOF
+
+  if command -v sendmail >/dev/null 2>&1; then
+    cat "${tmpBody}" | sendmail -t
+  elif command -v mail >/dev/null 2>&1; then
+    mail -s "${subject}" "${mailRecipient}" < "${tmpBody}"
+  fi
+
+  rm -f "${tmpBody}"
+}
+
+# Old exitFunction email code removed - now handled by sendEmailSummary
+# This comment marks where the old inline email generation was
 # Automatically updates the script to the latest version
 # to make it easier for those who need it
 versionCheck() {
@@ -243,7 +397,11 @@ getLastRunDate() {
   case "${os}" in
     Darwin)
       # Changed to use cut -f2- -d " " to allow for paths that contain a space
-      latestFile=$(find "${dataDir}" -mindepth 2 -type f ! -name ".DS_Store" -exec stat -f "%m %N" "{}" + 2>/dev/null | sort -nr 2>/dev/null | head -n 1 | cut -f2- -d " ")
+      # Wrap pipeline to avoid SIGPIPE triggering set -e/ERR on fresh runs
+      latestFile=$( { find "${dataDir}" -mindepth 2 -type f ! -name ".DS_Store" -exec stat -f "%m %N" "{}" + 2>/dev/null \
+        | sort -nr 2>/dev/null \
+        | head -n 1 2>/dev/null \
+        | cut -f2- -d " " 2>/dev/null; } || true )
       test -z "${latestFile}" && echo 0 && return 0 # DATALOG directory exists but there's no files. This is also a brand new sync.
 
       # Get the last modified date
@@ -254,7 +412,11 @@ getLastRunDate() {
     ;;
     Linux)
       # Changed to use cut -f2- -d " " to allow for paths that contain a space
-      latestFile=$(find "${dataDir}" -mindepth 2 -type f ! -name '.DS_Store' -printf '%T@ %p\n' 2>/dev/null | sort -nr 2>/dev/null | head -n 1 | cut -f2- -d " ")
+      # Wrap pipeline to avoid SIGPIPE triggering set -e/ERR on fresh runs
+      latestFile=$( { find "${dataDir}" -mindepth 2 -type f ! -name '.DS_Store' -printf '%T@ %p\n' 2>/dev/null \
+        | sort -nr 2>/dev/null \
+        | head -n 1 2>/dev/null \
+        | cut -f2- -d " " 2>/dev/null; } || true )
       test -z "${latestFile}" && echo 0 && return 0 # DATALOG directory exists but there's no files. This is also a brand new sync.
 
       # Return the last modified date in seconds
@@ -938,15 +1100,21 @@ overallStart="$(date +%s)"
 # their sd card contents wherever they want
 case "${os}" in
   Darwin)
-    keychainSDCardDir="$(security find-generic-password -ga "ezSharesdCardDir" 2>&1 | grep password | cut -f2- -d '"' | sed -e 's/^"//' -e 's/"$//')"
+    keychainSDCardDir="$(security find-generic-password -ga "ezSharesdCardDir" 2>&1 | grep password | cut -f2- -d '"' | sed -e 's/^"//' -e 's/"$//' || true)"
     if [ -n "${keychainSDCardDir}" ]; then
       sdCardDir="${keychainSDCardDir}"
     fi
+    # Try to load email recipient from keychain
+    mailRecipient="$(security find-generic-password -ga "ezShareMailTo" 2>&1 | grep password | cut -f2- -d '"' | sed -e 's/^"//' -e 's/"$//' || true)"
   ;;
   Linux)
     # Load the value from the sdCard configuration file
     if [ -f "${ezshareConfigDir}/ezSharesdCardDir" ]; then
       sdCardDir="$(head -1 "${ezshareConfigDir}/ezSharesdCardDir")"
+    fi
+    # Try to load email recipient from config
+    if [ -f "${ezshareConfigDir}/ezShareMailTo" ]; then
+      mailRecipient="$(head -1 "${ezshareConfigDir}/ezShareMailTo")"
     fi
   ;;
 esac
@@ -979,6 +1147,22 @@ if [ ! -d "${sdCardDir}" ]; then
     mkdir -p "${sdCardDir}"
   fi 
   echo
+fi
+
+# Prompt for email recipient if not set
+if [ -z "${mailRecipient}" ]; then
+  echo -n "Enter an email to receive run summaries (optional): "
+  read -r mailRecipient
+  if [ -n "${mailRecipient}" ]; then
+    case "${os}" in
+      Darwin)
+        security add-generic-password -T "/usr/bin/security" -U -a "ezShareMailTo" -s "ezShare" -w "${mailRecipient}"
+      ;;
+      Linux)
+        echo "${mailRecipient}" >"${ezshareConfigDir}/ezShareMailTo"
+      ;;
+    esac
+  fi
 fi
 
 # Reset the following global variables just in case they've changed
@@ -1056,10 +1240,10 @@ if [ "${numWifiAdaptors}" -eq 1 ]; then
     Darwin)
       wifiAdaptor="${wifiAdaptors}"
       # from the users Login keychain.
-      ezShareWifiSSID="$(security find-generic-password -ga "ezShareWifiSSID" 2>&1 | grep password | cut -f2- -d '"' | sed -e 's/^"//' -e 's/"$//')"
-      ezShareWiFiPassword="$(security find-generic-password -ga "ezShareWiFiPassword" 2>&1 | grep password | cut -f2- -d '"' | sed -e 's/^"//' -e 's/"$//')"
-      homeWiFiSSID="$(security find-generic-password -ga "homeWiFiSSID" 2>&1 | grep password | cut -f2- -d '"' | sed -e 's/^"//' -e 's/"$//')"
-      homeWiFiPassword="$(security find-generic-password -ga "homeWiFiPassword" 2>&1 | grep password | cut -f2- -d '"' | sed -e 's/^"//' -e 's/"$//')"
+      ezShareWifiSSID="$(security find-generic-password -ga "ezShareWifiSSID" 2>&1 | grep password | cut -f2- -d '"' | sed -e 's/^"//' -e 's/"$//' || true)"
+      ezShareWiFiPassword="$(security find-generic-password -ga "ezShareWiFiPassword" 2>&1 | grep password | cut -f2- -d '"' | sed -e 's/^"//' -e 's/"$//' || true)"
+      homeWiFiSSID="$(security find-generic-password -ga "homeWiFiSSID" 2>&1 | grep password | cut -f2- -d '"' | sed -e 's/^"//' -e 's/"$//' || true)"
+      homeWiFiPassword="$(security find-generic-password -ga "homeWiFiPassword" 2>&1 | grep password | cut -f2- -d '"' | sed -e 's/^"//' -e 's/"$//' || true)"
     ;;
     Linux)
       wifiAdaptor="${wifiAdaptors}"
@@ -1134,9 +1318,9 @@ fi
 case "${os}" in
   Darwin)
     # from the users Login keychain.
-    sleepHQClientUID="$(security find-generic-password -ga "sleepHQClientUID" 2>&1 | grep password | cut -f2- -d '"' | sed -e 's/^"//' -e 's/"$//')"
-    sleepHQClientSecret="$(security find-generic-password -ga "sleepHQClientSecret" 2>&1 | grep password | cut -f2- -d '"' | sed -e 's/^"//' -e 's/"$//')"
-    sleepHQDeviceID="$(security find-generic-password -ga "sleepHQDeviceID" 2>&1 | grep password | cut -f2- -d '"' | sed -e 's/^"//' -e 's/"$//')"
+    sleepHQClientUID="$(security find-generic-password -ga "sleepHQClientUID" 2>&1 | grep password | cut -f2- -d '"' | sed -e 's/^"//' -e 's/"$//' || true)"
+    sleepHQClientSecret="$(security find-generic-password -ga "sleepHQClientSecret" 2>&1 | grep password | cut -f2- -d '"' | sed -e 's/^"//' -e 's/"$//' || true)"
+    sleepHQDeviceID="$(security find-generic-password -ga "sleepHQDeviceID" 2>&1 | grep password | cut -f2- -d '"' | sed -e 's/^"//' -e 's/"$//' || true)"
   ;;
   Linux)
     # from config files
@@ -1359,6 +1543,15 @@ for arg in ${@}; do
     "--skip-o2")
     o2RingSyncEnabled=false
     ;;
+    "--exit-on-no-changes")
+    exitOnNoChanges=true
+    ;;
+    "--mail-on-error")
+    mailOnlyOnError=true
+    ;;
+    "--debug")
+    debugEnabled=true
+    ;;
     "--remove-sleephq")
       case "${os}" in
         Darwin)
@@ -1416,6 +1609,16 @@ for arg in ${@}; do
       bash "${me}" --remove-home
       exit 0
     ;;
+    "--reset-last-run")
+      # Remove the last run timestamp file to force a full re-evaluation
+      if [ -f "${lastRunFile}" ]; then
+        rm -f "${lastRunFile}"
+        echo "Last run timestamp reset. Next run will consider all data."
+      else
+        echo "No last run file found at ${lastRunFile}."
+      fi
+      exit 0
+    ;;
     "--reset-sd")
       case "${os}" in
         Darwin)
@@ -1467,6 +1670,19 @@ for arg in ${@}; do
       echo "Don't sync O2 CSV export files to Sleep HQ:"
       echo "${0} --skip-o2"
       echo
+      echo "Exit with status code 2 if no new files were found on the SD card"
+      echo "(lets you chain another command with && that only runs when there's new data):"
+      echo "${0} --exit-on-no-changes"
+      echo
+      echo "Only send the summary email when an error occurs:"
+      echo "${0} --mail-on-error"
+      echo
+      echo "Enable verbose bash tracing for troubleshooting:"
+      echo "${0} --debug"
+      echo
+      echo "Reset the last run timestamp so the next run re-evaluates all SD card data:"
+      echo "${0} --reset-last-run"
+      echo
       echo "Set the number of parallel streams to run when checking files/directories:"
       echo "${0} --max-streams=15"
       echo
@@ -1483,11 +1699,10 @@ for arg in ${@}; do
       echo "${0} --remove-home"
       echo
       echo "Remove all credentials (home/ezshare/sleephq):"
-      echo "${0} --remove-credentials"
+      echo "${0} --remove-all"
       echo
       echo "Reset SD Card location in keychain:"
       echo "${0} --reset-sd"
-      ezSharesdCardDir
       echo
       echo "Dual wifi adaptor automation mode:"
       echo "${0} --dedicated"
@@ -1506,6 +1721,11 @@ done
 ## INSTALLATION/PRE-FLIGHT CHECKS COMPLETE ##
 ########## SCRIPT EXECUTION BEGINS ##########
 #############################################
+
+# Enable shell tracing if requested
+if ${debugEnabled}; then
+  set -x
+fi
 
 if ${sleepDataSyncEnabled}; then
   # Make sure we can connect to the home WiFi network
@@ -1563,17 +1783,22 @@ if ${sleepDataSyncEnabled}; then
   # Connect to the wifi network
   if [ "${numWifiAdaptors}" -eq 1 ]; then
     if ! connectToWifiNetwork "${wifiAdaptor}" "${ezShareWifiSSID}" "${ezShareWiFiPassword}"; then
-      exit 1 # We failed to connect to the wifi network
+      errorOccurred=1
+      errorLog+="Failed to connect to Ez Share WiFi.\n"
+      exit 1
     fi
     ezShareConnected=1 # Ensures we reconnect to the home wifi network if anything fails
+    # Give network stack 2s to fully establish routing before connectivity check
+    sleep 2
   fi
 
   echo -ne "\nVerifying connectivity to EZ Share Web Interface..."
-  if waitForConnectivity "${ezshareURL}"
-    then
-    echo -e " ${green}DONE!${reset}"
-
+  if ! waitForConnectivity "${ezshareURL}"; then
+    echo
+    echo "Cannot continue... exiting..."
+    exit 1
   fi
+  echo -e " ${green}DONE!${reset}"
 
   start="$(date +%s)"
   echo -ne "\nSearching SD Card for directories to check..."
@@ -1611,12 +1836,27 @@ if ${sleepDataSyncEnabled}; then
       # Make sure we reconnect to the home wifi network
       # because we don't need the SD card anymore
       if ! connectToWifiNetwork "${wifiAdaptor}" "${homeWiFiSSID}" "${homeWiFiPassword}"; then
-        exit 1 # We failed to connect to the wifi network
+        errorOccurred=1
+        errorLog+="Failed to reconnect to home WiFi after sync.\n"
+        exit 1
       fi
       ezShareConnected=0 # disables automatic reconnection to home wifi because we're already connected
-      waitForConnectivity "${sleepHQAPIBaseURL}"
+      if ! waitForConnectivity "${sleepHQAPIBaseURL}"; then
+        errorOccurred=1
+        errorLog+="Failed to verify connectivity to SleepHQ after reconnecting to home WiFi.\n"
+      fi
     fi
     echo -e "\nLocal filesystem is already up to date with SD Card."
+    syncStatus="No changes"
+    # Ensure last-run file exists/recreated even when no changes
+    if [ ! -f "${lastRunFile}" ]; then
+      if [ "${lastRunDateInSeconds}" -gt 0 ] 2>/dev/null; then
+        storeLastRunTimestamp "${lastRunDateInSeconds}" "${lastRunFile}"
+      else
+        storeLastRunTimestamp "$(date +%s)" "${lastRunFile}"
+      fi
+      echo "Last run timestamp initialized at ${lastRunFile}."
+    fi
   else
     echo -e "\nStarting SD card sync\n"
     ezShareSyncInProgress=1
@@ -1626,16 +1866,23 @@ if ${sleepDataSyncEnabled}; then
     end="$(date +%s)"
     timeTaken=$(( end - start ))
     echo -e "\nSD card sync complete. Time taken: ${timeTaken} seconds. Files downloaded: ${numFiles} files.\n"
+    syncStatus="Downloaded ${numFiles} files"
     ezShareSyncInProgress=0
     
     if [ "${numWifiAdaptors}" -eq 1 ]; then
       if ! connectToWifiNetwork "${wifiAdaptor}" "${homeWiFiSSID}" "${homeWiFiPassword}"; then
-        exit 1 # We failed to connect to the wifi network
+        errorOccurred=1
+        errorLog+="Failed to reconnect to home WiFi after downloading files.\n"
+        exit 1
       fi
       ezShareConnected=0 # disables automatic reconnection to home wifi because we're already connected
     fi
 
-    waitForConnectivity "${sleepHQAPIBaseURL}"
+    if ! waitForConnectivity "${sleepHQAPIBaseURL}"; then
+      errorOccurred=1
+      errorLog+="Failed to verify connectivity to SleepHQ API.\n"
+      # Continue anyway - user may not be using SleepHQ uploads
+    fi
 
     # if there's no sleep data, there's no point continuing
     # user was probably uploading files only.
@@ -1644,9 +1891,9 @@ if ${sleepDataSyncEnabled}; then
       echo "Data was synchronized from the SD card but none of it was sleep data."
       echo "This usually happens if configuration files have changed but you" 
       echo "haven't recorded new sleep data yet."
+      # Advance last-run since there's nothing to upload
       storeLastRunTimestamp "$(date +%s)" "${lastRunFile}"
     else
-      storeLastRunTimestamp "$(date +%s)" "${lastRunFile}"
       # If uploads to sleep HQ are enabled, create the zip file and upload it.
       if ${sleepHQuploadsEnabled}; then
         start="$(date +%s)"
@@ -1686,8 +1933,10 @@ if ${sleepDataSyncEnabled}; then
             echo "curl --connect-timeout 20 --max-time 300 -X 'POST' \"${sleepHQLoginURL}\""
             echo -ne "\nOutput: "
             curl -k --connect-timeout 20 --max-time 300 -X 'POST' "${sleepHQLoginURL}"
-            echo -e "\n\nCannot continue with upload... exiting now..."
-            exit 1
+            echo -e "\n\nCannot continue with upload... skipping SleepHQ upload"
+            errorOccurred=1
+            errorLog+="Failed to obtain SleepHQ API access token.\n"
+            uploadStatus="Failed: No API access token"
           else
             echo -e " ${green} DONE!${reset}"
           fi
@@ -1699,61 +1948,80 @@ if ${sleepDataSyncEnabled}; then
             sleepHQTeamID=$(getSleepHQTeamID "${sleepHQAccessToken}" "${sleepHQAPIBaseURL}")
             # Team ID is expected to be a number. If it's not something went wrong.
             if ! [[ ${sleepHQTeamID} =~ ^[0-9]+$ ]]; then
-              echo -e " ${red}FAILED!${reset}\n\nFailed to obtain your Sleep HQ Team ID. Debug output for troubleshooting is shownn below: "
+              echo -e " ${red}FAILED!${reset}\n\nFailed to obtain your Sleep HQ Team ID. Debug output for troubleshooting is shown below: "
               echo -e "\nCommand:"
               echo "curl --connect-timeout 20 --max-time 300 \"${sleepHQAPIBaseURL}/api/v1/me\" -H 'accept: application/vnd.api+json' -H \"authorization: Bearer ${sleepHQAccessToken}\""
               echo -ne "\nOutput: "
               curl -k --connect-timeout 20 --max-time 300 "${sleepHQAPIBaseURL}/api/v1/me" -H 'accept: application/vnd.api+json' -H "authorization: Bearer ${sleepHQAccessToken}"
-              echo -e "\nCannot continue with upload... exiting now..."
-              exit 1
+              echo -e "\nCannot continue with upload... skipping SleepHQ upload"
+              errorOccurred=1
+              errorLog+="Failed to obtain SleepHQ Team ID.\n"
+              uploadStatus="Failed: No Team ID"
+              sleepHQTeamID="" # Clear to skip upload
+            else
+              echo -e " ${green}DONE!${reset} Sleep HQ Team ID set to ${sleepHQTeamID}."
             fi
-            echo -e " ${green}DONE!${reset} Sleep HQ Team ID set to ${sleepHQTeamID}."
         fi
 
-        # Create an Import task
-        echo -ne "\nCreating Data Import task..."
-        sleepHQImportTaskID=$(createImportTask "${sleepHQAccessToken}" "${sleepHQAPIBaseURL}" "${sleepHQTeamID}" "${sleepHQDeviceID}")
+        # Only continue with upload if we have Team ID
+        if [ -n "${sleepHQTeamID}" ] && [[ ${sleepHQTeamID} =~ ^[0-9]+$ ]]; then
+          # Create an Import task
+          echo -ne "\nCreating Data Import task..."
+          sleepHQImportTaskID=$(createImportTask "${sleepHQAccessToken}" "${sleepHQAPIBaseURL}" "${sleepHQTeamID}" "${sleepHQDeviceID}")
     
-
-        # Import Task ID is expected to be a number. If it's not something went wrong.
-        if ! [[ ${sleepHQImportTaskID} =~ ^[0-9]+$ ]]; then
-          echo -e " ${red}FAILED!${reset}\n\nFailed to generate an Import Task ID. Debug output for troubleshooting is shownn below: \n"
-          echo "Command:"
-          echo -e "curl --connect-timeout 20 --max-time 300 -X 'POST' \"${sleepHQImportTaskURL}\" -H 'accept: application/vnd.api+json' -H \"authorization: Bearer ${sleepHQAccessToken}\"\n"
-          echo -n "Output: "
-          curl -k --connect-timeout 20 --max-time 300 -X 'POST' "${sleepHQImportTaskURL}" -H 'accept: application/vnd.api+json' -H "authorization: Bearer ${sleepHQAccessToken}"
-          echo -e "\n\nCannot continue with upload... exiting now..."
-          exit 1
-        else
-           echo -e "${green}DONE!${reset} Import Task ID: ${sleepHQImportTaskID}"
-        fi  
-
-        # Start trapping exit signals so we remove the
-        # import task ID if anything goes wrong.
-        trap exitFunction INT TERM EXIT
-
-        sleepHQcontentHash=$(generateContentHash "${uploadZipFileName}")
-        
-        echo -ne "\nUploading ${uploadZipFileName} to Sleep HQ..."
-        if uploadFileToSleepHQ "${sleepHQAccessToken}" "${sleepHQAPIBaseURL}" "${sleepHQImportTaskID}" "${uploadZipFileName}" "${sleepHQcontentHash}"
-          then
-          echo -e " ${green}DONE!${reset}"
+          # Import Task ID is expected to be a number. If it's not something went wrong.
+          if ! [[ ${sleepHQImportTaskID} =~ ^[0-9]+$ ]]; then
+            echo -e " ${red}FAILED!${reset}\n\nFailed to generate an Import Task ID. Debug output for troubleshooting is shown below: \n"
+            echo "Command:"
+            echo -e "curl --connect-timeout 20 --max-time 300 -X 'POST' \"${sleepHQImportTaskURL}\" -H 'accept: application/vnd.api+json' -H \"authorization: Bearer ${sleepHQAccessToken}\"\n"
+            echo -n "Output: "
+            curl -k --connect-timeout 20 --max-time 300 -X 'POST' "${sleepHQImportTaskURL}" -H 'accept: application/vnd.api+json' -H "authorization: Bearer ${sleepHQAccessToken}"
+            echo -e "\n\nCannot continue with upload... skipping SleepHQ upload"
+            errorOccurred=1
+            errorLog+="Failed to create SleepHQ import task.\n"
+            uploadStatus="Failed: Import task creation failed"
           else
-          echo -e " ${red}FAILED!${reset}"
-          exit 1
+            echo -e "${green}DONE!${reset} Import Task ID: ${sleepHQImportTaskID}"
+
+            # Start trapping exit signals so we remove the
+            # import task ID if anything goes wrong.
+            trap exitFunction INT TERM EXIT
+
+            sleepHQcontentHash=$(generateContentHash "${uploadZipFileName}")
+            
+            echo -ne "\nUploading ${uploadZipFileName} to Sleep HQ..."
+            if uploadFileToSleepHQ "${sleepHQAccessToken}" "${sleepHQAPIBaseURL}" "${sleepHQImportTaskID}" "${uploadZipFileName}" "${sleepHQcontentHash}"; then
+              echo -e " ${green}DONE!${reset}"
+            else
+              echo -e " ${red}FAILED!${reset}"
+              errorOccurred=1
+              errorLog+="Failed to upload zip file to SleepHQ.\n"
+              uploadStatus="Failed: Upload error"
+            fi
+
+            if [ "${errorOccurred}" -eq 0 ]; then
+              echo -e "\nBeginning Data Import processing of ${uploadZipFileName}...\n"
+              triggerDataImport "${sleepHQAccessToken}" "${sleepHQAPIBaseURL}" "${sleepHQImportTaskID}"
+
+              monitorImportProgress "${sleepHQAccessToken}" "${sleepHQAPIBaseURL}" "${sleepHQImportTaskID}"
+
+              # Remove exit trapping because upload has either finished or been abandoned.
+              trap - INT TERM EXIT
+
+              end="$(date +%s)"
+              timeTaken=$(( end - start ))
+              echo -e "\nUpload to Sleep HQ complete. Time taken: ${timeTaken} seconds.\n"
+              uploadStatus="SleepHQ upload complete (Import ID: ${sleepHQImportTaskID})"
+              # Advance last-run only after successful upload
+              storeLastRunTimestamp "$(date +%s)" "${lastRunFile}"
+            else
+              trap - INT TERM EXIT
+            fi
+          fi
         fi
-
-        echo -e "\nBeginning Data Import processing of ${uploadZipFileName}...\n"
-        triggerDataImport "${sleepHQAccessToken}" "${sleepHQAPIBaseURL}" "${sleepHQImportTaskID}"
-
-        monitorImportProgress "${sleepHQAccessToken}" "${sleepHQAPIBaseURL}" "${sleepHQImportTaskID}"
-
-        # Remove exit trapping because upload has either finished or been abandoned.
-        trap - INT TERM EXIT
-
-        end="$(date +%s)"
-        timeTaken=$(( end - start ))
-        echo -e "\nUpload to Sleep HQ complete. Time taken: ${timeTaken} seconds.\n"
+      else
+        # Uploads disabled; advance last-run after local sync
+        storeLastRunTimestamp "$(date +%s)" "${lastRunFile}"
       fi
     fi
   fi
@@ -1856,15 +2124,18 @@ if ${o2RingSyncEnabled} && ${sleepHQuploadsEnabled}; then
     find "${sdCardDir}" -mindepth 1 -maxdepth 1 -type f -name "O2Ring*.csv" -exec rm -f "{}" \;
 
     trap - INT TERM EXIT
+    o2Status="O2 Ring CSVs uploaded (Import ID: ${sleepHQImportTaskID})"
   fi
 fi
 
 overallEnd="$(date +%s)"
 overallTimeTaken=$(( overallEnd - overallStart ))
 
-# Remove the lock file if it exists
-if [ -f "${lockfile}" ]; then
-  rm -f "${lockfile}"
-fi
-
 echo -e "\nScript execution complete! Script execution time: ${overallTimeTaken} seconds."
+
+# Trigger exit handler which will send email summary
+# Return exit code 2 if no new files were downloaded (to allow chaining with &&)
+if [ "${exitOnNoChanges}" = true ] && [ "${syncStatus}" = "No changes" ]; then
+  exit 2
+fi
+exit 0
